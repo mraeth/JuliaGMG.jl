@@ -1,0 +1,14 @@
+# Julia
+*.jl.cov
+*.jl.mem
+*.ji
+/Manifest.toml
+/docs/build/
+
+# Julia package artifacts
+deps/deps.jl
+deps/build.log
+
+# OS
+.DS_Store
+Thumbs.db
