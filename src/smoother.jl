@@ -1,5 +1,5 @@
-# Smoothers for generic FDOp.  The diagonal and off-diagonal weights come from
-# op.stencil_fn so the same smoother code works for any 5-point operator.
+# Smoothers for generic FDOp.  Weights come from op.stencil_fn and the stencil
+# topology from op.stencil, so the same smoother code works for any N-point operator.
 
 # ---------------------------------------------------------------------------
 # Weighted Jacobi: x += ω * D^{-1} * (b - Ax)
@@ -12,10 +12,11 @@ function jacobi_sweep!(lvl::Level, nsweeps::Int; omega=2/3)
     ihx2 = 1 / op.hx^2
     ihy2 = 1 / op.hy^2
 
+    cidx = op.stencil.center_idx
     for _ in 1:nsweeps
         residual!(lvl.r, lvl)
         @inbounds for j in 2:ny+1, i in 2:nx+1
-            d, = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
+            d = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)[cidx]
             lvl.x[i,j] += ω * lvl.r[i,j] / d
         end
     end
@@ -32,15 +33,22 @@ function rbgs_sweep!(lvl::Level, nsweeps::Int)
     ihx2 = 1 / op.hx^2
     ihy2 = 1 / op.hy^2
 
+    cidx    = op.stencil.center_idx
+    offsets = op.stencil.offsets
     for _ in 1:nsweeps
         fill_bc_dirichlet!(lvl.x, op)
 
         # Red pass (i+j even)
         @inbounds for j in 2:ny+1, i in 2:nx+1
             (i + j) % 2 == 0 || continue
-            d, wx_neg, wx_pos, wy_neg, wy_pos = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
-            off = wx_neg * lvl.x[i-1,j] + wx_pos * lvl.x[i+1,j] +
-                  wy_neg * lvl.x[i,j-1] + wy_pos * lvl.x[i,j+1]
+            weights = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
+            d   = weights[cidx]
+            off = zero(eltype(lvl.x))
+            for k in eachindex(weights)
+                k == cidx && continue
+                di, dj = offsets[k]
+                off += weights[k] * lvl.x[i+di, j+dj]
+            end
             lvl.x[i,j] = (lvl.b[i,j] - off) / d
         end
 
@@ -49,9 +57,14 @@ function rbgs_sweep!(lvl::Level, nsweeps::Int)
         # Black pass (i+j odd)
         @inbounds for j in 2:ny+1, i in 2:nx+1
             (i + j) % 2 == 1 || continue
-            d, wx_neg, wx_pos, wy_neg, wy_pos = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
-            off = wx_neg * lvl.x[i-1,j] + wx_pos * lvl.x[i+1,j] +
-                  wy_neg * lvl.x[i,j-1] + wy_pos * lvl.x[i,j+1]
+            weights = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
+            d   = weights[cidx]
+            off = zero(eltype(lvl.x))
+            for k in eachindex(weights)
+                k == cidx && continue
+                di, dj = offsets[k]
+                off += weights[k] * lvl.x[i+di, j+dj]
+            end
             lvl.x[i,j] = (lvl.b[i,j] - off) / d
         end
     end

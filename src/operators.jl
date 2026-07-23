@@ -15,14 +15,17 @@ end
 # y ← A*x  (interior only; ghost ring of y is left undefined)
 function apply!(y, op::FDOp, x)
     fill_bc_dirichlet!(x, op)
-    nx, ny = op.nx, op.ny
     ihx2 = 1 / op.hx^2
     ihy2 = 1 / op.hy^2
-    @inbounds for j in 2:ny+1, i in 2:nx+1
-        d, wx_neg, wx_pos, wy_neg, wy_pos = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
-        y[i,j] = d * x[i,j] +
-                 wx_neg * x[i-1,j] + wx_pos * x[i+1,j] +
-                 wy_neg * x[i,j-1] + wy_pos * x[i,j+1]
+    offsets = op.stencil.offsets
+    @inbounds for j in 2:op.ny+1, i in 2:op.nx+1
+        weights = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
+        acc = zero(eltype(y))
+        for k in eachindex(weights)
+            di, dj = offsets[k]
+            acc += weights[k] * x[i+di, j+dj]
+        end
+        y[i,j] = acc
     end
     y
 end

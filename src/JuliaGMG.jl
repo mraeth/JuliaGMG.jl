@@ -7,6 +7,7 @@ include("transfer.jl")
 include("vcycle.jl")
 include("solver.jl")
 
+export StencilSpec, STENCIL_5PT
 export FDOp, Level, MGHierarchy, build_hierarchy
 export apply!, fill_bc_dirichlet!, residual!, interior_norm
 export vec_to_padded!, padded_to_vec!

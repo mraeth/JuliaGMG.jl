@@ -197,14 +197,34 @@ Output format matches the C++ `mfes` `--verbose 2` output for direct comparison 
 
 ## Adding a New Operator
 
-Construct an `FDOp` directly with your own `stencil_fn` and `coarsen_fn`. No library changes are needed.
+Construct an `FDOp` directly with your own `StencilSpec`, `stencil_fn`, and `coarsen_fn`. No library changes are needed.
+
+### StencilSpec
+
+`StencilSpec{N}` describes the topology of an N-point stencil as a compile-time constant:
+
+```julia
+struct StencilSpec{N}
+    offsets::NTuple{N, NTuple{2,Int}}   # (di, dj) offsets in padded-index space
+    center_idx::Int                      # index of the (0,0) entry
+end
+```
+
+The library provides `STENCIL_5PT` for the canonical 5-point layout (west, east, south, north, center):
+
+```julia
+STENCIL_5PT = StencilSpec(((-1,0),(1,0),(0,-1),(0,1),(0,0)), 5)
+```
+
+`stencil_fn` must return an `NTuple{N,T}` with weights ordered to match `offsets`.
 
 ### Pure Laplacian (−∇²u = f, no coefficient field)
 
 ```julia
 dummy = zeros(T, nx+2, ny+2)   # coeff array unused
 op = FDOp(dummy, nx, ny, hx, hy,
-    (i, j, _, ihx2, ihy2) -> (2*ihx2 + 2*ihy2, -ihx2, -ihx2, -ihy2, -ihy2),
+    STENCIL_5PT,
+    (i, j, _, ihx2, ihy2) -> (-ihx2, -ihx2, -ihy2, -ihy2, 2*ihx2 + 2*ihy2),
     (fa, cnx, cny) -> similar(fa, cnx+2, cny+2))
 ```
 
@@ -219,14 +239,15 @@ flux balance:
 α_{i+½,j} = 2 α[i,j] α[i+1,j] / (α[i,j] + α[i+1,j])
 ```
 
-The resulting 5-point stencil at interior padded cell `(i,j)` is:
+The resulting 5-point stencil weights, ordered west/east/south/north/center to match
+`STENCIL_5PT`, are:
 
 ```text
-diag     =  (α_{i+½,j} + α_{i-½,j}) / hx²  +  (α_{i,j+½} + α_{i,j-½}) / hy²
-wx_pos   = -α_{i+½,j} / hx²
-wx_neg   = -α_{i-½,j} / hx²
-wy_pos   = -α_{i,j+½} / hy²
-wy_neg   = -α_{i,j-½} / hy²
+west   = -α_{i-½,j} / hx²
+east   = -α_{i+½,j} / hx²
+south  = -α_{i,j-½} / hy²
+north  = -α_{i,j+½} / hy²
+center =  (α_{i+½,j} + α_{i-½,j}) / hx²  +  (α_{i,j+½} + α_{i,j-½}) / hy²
 ```
 
 ```julia
@@ -237,12 +258,12 @@ stencil_fn = (i, j, coeff, ihx2, ihy2) -> begin
     an = coeff[i,   j+1]            # north
     as = coeff[i,   j-1]            # south
     # harmonic-mean face conductivities
-    wxp = -2*a*ae / (a + ae) * ihx2
-    wxn = -2*a*aw / (a + aw) * ihx2
-    wyp = -2*a*an / (a + an) * ihy2
-    wyn = -2*a*as / (a + as) * ihy2
-    diag = -(wxp + wxn + wyp + wyn)  # positive (M-matrix)
-    (diag, wxn, wxp, wyn, wyp)
+    wxn = -2*a*aw / (a + aw) * ihx2   # west
+    wxp = -2*a*ae / (a + ae) * ihx2   # east
+    wyn = -2*a*as / (a + as) * ihy2   # south
+    wyp = -2*a*an / (a + an) * ihy2   # north
+    diag = -(wxn + wxp + wyn + wyp)   # positive (M-matrix)
+    (wxn, wxp, wyn, wyp, diag)        # ordered: west, east, south, north, center
 end
 
 # Harmonic coarsening: preserves the divergence-form structure at coarser levels
@@ -256,7 +277,7 @@ coarsen_fn = (fa, cnx, cny) -> begin
     ca
 end
 
-op = FDOp(alpha, nx, ny, hx, hy, stencil_fn, coarsen_fn)
+op = FDOp(alpha, nx, ny, hx, hy, STENCIL_5PT, stencil_fn, coarsen_fn)
 ```
 
 Note: `coeff` at the ghost ring `[1,:]`, `[end,:]`, `[:,1]`, `[:,end]` is zero by convention
@@ -270,11 +291,11 @@ ghost ring, guard with `(a + ae) > 0` or clamp the denominator.
 
 ```julia
 op = FDOp(alpha, nx, ny, hx, hy,
+    STENCIL_5PT,
     (i, j, coeff, ihx2, ihy2) ->
-        (coeff[i,j] + 2*ihx2 + 2*ihy2, -ihx2, -ihx2, -ihy2, -ihy2),
+        (-ihx2, -ihx2, -ihy2, -ihy2, coeff[i,j] + 2*ihx2 + 2*ihy2),
     (fa, cnx, cny) -> begin
         ca = similar(fa, cnx+2, cny+2); fill!(ca, zero(eltype(fa)))
-        # harmonic average of 2×2 blocks
         @views ca[2:cnx+1, 2:cny+1] .= 4 ./ (
             1 ./ fa[2:2:2*cnx+1, 2:2:2*cny+1] .+
             1 ./ fa[3:2:2*cnx+2, 2:2:2*cny+1] .+
@@ -284,10 +305,39 @@ op = FDOp(alpha, nx, ny, hx, hy,
     end)
 ```
 
+### 9-point isotropic Laplacian
+
+For a 9-point stencil, define the offsets explicitly and order the `stencil_fn` return
+tuple to match:
+
+```julia
+STENCIL_9PT = StencilSpec(
+    ((-1,0),(1,0),(0,-1),(0,1),(-1,-1),(1,-1),(-1,1),(1,1),(0,0)), 9
+)
+
+# Isotropic 9-point Laplacian weights (Mehrstellen / Collatz scheme):
+#   cardinal neighbors: weight = 1/(6 h²),  diagonal neighbors: 1/(12 h²),
+#   center: -(4/(6h²) + 4/(12h²)) = -10/(12h²)   [assumes hx == hy == h]
+stencil_fn_9pt = (i, j, _, ihx2, ihy2) -> begin
+    wc = ihx2 / 6         # cardinal weight (assumes hx == hy)
+    wd = ihx2 / 12        # diagonal weight
+    (-wc, -wc, -wc, -wc, -wd, -wd, -wd, -wd, 4*wc + 4*wd)
+end
+
+op = FDOp(dummy, nx, ny, hx, hy, STENCIL_9PT, stencil_fn_9pt,
+          (fa, cnx, cny) -> similar(fa, cnx+2, cny+2))
+```
+
+> **RBGS coloring note:** The `(i+j) % 2` coloring used by the RBGS smoother does not
+> guarantee independent simultaneous updates for 9-point stencils — diagonal neighbors
+> `(i±1,j±1)` share the same color as `(i,j)`. The smoother remains valid (Gauss-Seidel-like
+> ordering) but is no longer a true simultaneous update. Use Jacobi (`jacobi_sweep!`) if
+> strict independence is required.
+
 ### Stencil function signature reference
 
 ```text
-stencil_fn(i, j, coeff, ihx2, ihy2) -> (diag, wx_neg, wx_pos, wy_neg, wy_pos)
+stencil_fn(i, j, coeff, ihx2, ihy2) -> NTuple{N, T}
 ```
 
 | Argument | Meaning |
@@ -295,11 +345,9 @@ stencil_fn(i, j, coeff, ihx2, ihy2) -> (diag, wx_neg, wx_pos, wy_neg, wy_pos)
 | `i`, `j` | Padded array indices of the current interior cell |
 | `coeff` | Full padded coefficient array at this multigrid level |
 | `ihx2`, `ihy2` | Precomputed `1/hx²`, `1/hy²` |
-| `diag` | Center (diagonal) stencil weight |
-| `wx_neg`, `wx_pos` | Weights for `x[i-1,j]`, `x[i+1,j]` |
-| `wy_neg`, `wy_pos` | Weights for `x[i,j-1]`, `x[i,j+1]` |
+| return value | `N` weights, one per entry of `stencil.offsets` |
 
-The stencil function is called identically inside `apply!` and both smoothers, so it is the single source of truth for the operator.
+The stencil function is called identically inside `apply!` and both smoothers.
 
 ```text
 coarsen_fn(fine_coeff, cnx, cny) -> coarse_coeff

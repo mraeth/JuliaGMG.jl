@@ -1,20 +1,36 @@
 using Adapt
 using LinearAlgebra: lu, ldiv!, LU
 
-# Generic 5-point finite-difference operator.
+# Stencil topology: N offsets (di,dj) in padded-index space; center_idx is the
+# index of the (0,0) entry.  N is a compile-time constant so the inner loop
+# in apply! compiles to fixed-size iteration without dynamic dispatch.
+struct StencilSpec{N}
+    offsets::NTuple{N, NTuple{2,Int}}
+    center_idx::Int
+    function StencilSpec(offsets::NTuple{N, NTuple{2,Int}}, center_idx::Int) where N
+        @assert offsets[center_idx] == (0, 0) "center_idx must point to the (0,0) offset"
+        new{N}(offsets, center_idx)
+    end
+end
+
+# Canonical 5-point stencil: west, east, south, north, center.
+const STENCIL_5PT = StencilSpec(((-1,0),(1,0),(0,-1),(0,1),(0,0)), 5)
+
+# Generic N-point finite-difference operator.
 #
-# stencil_fn(i, j, coeff, ihx2, ihy2) -> (diag, wx_neg, wx_pos, wy_neg, wy_pos)
-#   Returns the five stencil weights for interior cell (i,j), where (i,j) are
-#   padded indices (interior ↔ [2:nx+1, 2:ny+1]).  ihx2 = 1/hx², ihy2 = 1/hy².
+# stencil_fn(i, j, coeff, ihx2, ihy2) -> NTuple{N, T}
+#   Returns N stencil weights for interior cell (i,j) in padded-index space,
+#   ordered to match stencil.offsets.  ihx2 = 1/hx², ihy2 = 1/hy².
 #
 # coarsen_fn(fine_coeff, cnx, cny) -> coarse_coeff
 #   Returns a padded (cnx+2)×(cny+2) coefficient array for the next coarser level.
-struct FDOp{T, A<:AbstractMatrix{T}, StencilFn, CoarsenFn}
+struct FDOp{T, A<:AbstractMatrix{T}, N, StencilFn, CoarsenFn}
     coeff::A
     nx::Int
     ny::Int
     hx::T
     hy::T
+    stencil::StencilSpec{N}
     stencil_fn::StencilFn
     coarsen_fn::CoarsenFn
 end
@@ -79,7 +95,7 @@ function build_hierarchy(op0::FDOp{T,A}; npre=2, npost=2, min_coarse=4) where {T
         chx  = cur_op.hx * 2
         chy  = cur_op.hy * 2
         ca   = cur_op.coarsen_fn(cur_op.coeff, cnx, cny)
-        cur_op = FDOp(ca, cnx, cny, chx, chy, cur_op.stencil_fn, cur_op.coarsen_fn)
+        cur_op = FDOp(ca, cnx, cny, chx, chy, cur_op.stencil, cur_op.stencil_fn, cur_op.coarsen_fn)
         push!(levels, make_level(cur_op))
     end
 
@@ -89,7 +105,7 @@ function build_hierarchy(op0::FDOp{T,A}; npre=2, npost=2, min_coarse=4) where {T
     nx_c, ny_c = coarse_op.nx, coarse_op.ny
     coeff_cpu  = convert(Matrix{T}, Array(coarse_op.coeff))
     cpu_op     = FDOp(coeff_cpu, nx_c, ny_c, coarse_op.hx, coarse_op.hy,
-                      coarse_op.stencil_fn, coarse_op.coarsen_fn)
+                      coarse_op.stencil, coarse_op.stencil_fn, coarse_op.coarsen_fn)
     coarse_lu  = lu(_assemble_dense(cpu_op))
 
     MGHierarchy{T, eltype(levels), typeof(coarse_lu)}(levels, npre, npost, coarse_lu)
