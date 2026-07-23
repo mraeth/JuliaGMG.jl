@@ -15,6 +15,11 @@ Pkg.activate(joinpath(@__DIR__, ".."))
 using JuliaGMG
 using Printf
 
+const _HELMHOLTZ_DIR = joinpath(@__DIR__, "..", "helmholtz")
+include(joinpath(_HELMHOLTZ_DIR, "helmholtz_op.jl"))
+include(joinpath(_HELMHOLTZ_DIR, "alpha_fields.jl"))
+include(joinpath(_HELMHOLTZ_DIR, "runner.jl"))
+
 # ---------------------------------------------------------------------------
 # Argument parsing (hand-rolled to avoid extra dependency)
 # ---------------------------------------------------------------------------
@@ -88,17 +93,17 @@ function main(argv=ARGS)
                        alpha_max=opts["alpha_max"],
                        n_periods=n_periods)
 
-    op = HelmholtzOp{T, Matrix{T}}(alpha, nx, ny, hx, hy)
+    op = HelmholtzOp(alpha, nx, ny, hx, hy)
 
-    solver_sym = opts["solver"] == "CG" ? :CG : :GMRES
+    solver = opts["solver"] == "CG" ? CG() : GMRES()
 
-    if solver_sym == :CG && opts["op"] == "HELMHOLTZ"
+    if solver isa CG && opts["op"] == "HELMHOLTZ"
         # CG is valid for Helmholtz (SPD when alpha > 0); warn but proceed
         @printf("NOTE: CG with HELMHOLTZ operator (alpha > 0 required for SPD).\n")
     end
 
     run_solver(op;
-               solver_type = solver_sym,
+               solver      = solver,
                tol_rel     = T(opts["tol_rel"]),
                tol_abs     = T(opts["tol_abs"]),
                max_iters   = opts["max_iters"],

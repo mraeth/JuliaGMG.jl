@@ -13,7 +13,7 @@
 #   In padded indices: fine[2I, 2I+1] × fine[2J, 2J+1] += coarse[I+1, J+1]
 
 # b_coarse ← R * r_fine  (writes interior of b_coarse; ghost ring is left zero)
-function restrict!(b_coarse, r_fine, fine_op::HelmholtzOp)
+function restrict!(b_coarse, r_fine, fine_op)
     nx, ny = fine_op.nx, fine_op.ny
     cnx, cny = nx ÷ 2, ny ÷ 2
     T = eltype(b_coarse)
@@ -27,7 +27,7 @@ function restrict!(b_coarse, r_fine, fine_op::HelmholtzOp)
 end
 
 # x_fine += P * x_coarse  (adds to interior of x_fine; ghost ring not touched here)
-function prolong_add!(x_fine, x_coarse, coarse_op::HelmholtzOp)
+function prolong_add!(x_fine, x_coarse, coarse_op)
     cnx, cny = coarse_op.nx, coarse_op.ny
     @inbounds for J in 1:cny, I in 1:cnx
         fi = 2*I; fj = 2*J

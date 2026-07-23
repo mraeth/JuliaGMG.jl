@@ -1,32 +1,39 @@
 # JuliaGMG
 
-A GPU-capable Julia version of a geometric multigrid preconditioned Krylov solver. Solves the 2D variable-coefficient Helmholtz equation
+A GPU-capable Julia version of a geometric multigrid preconditioned Krylov solver. Solves 2D variable-coefficient PDEs on the unit square with Dirichlet boundary conditions using a Krylov outer loop (GMRES or CG) preconditioned by one multigrid V-cycle per iteration. The implementation runs on CPU today and is GPU-portable via `KernelAbstractions.jl` and `Adapt.jl`.
+
+The built-in operator is the variable-coefficient Helmholtz equation:
 
 ```
 (α(x,y) − ∇²) u = f    on [0,1]²,  u = 0 on ∂Ω
 ```
 
-using a Krylov outer loop (GMRES or CG) preconditioned by one multigrid V-cycle per iteration. The implementation is designed to run on CPU today and is GPU-portable via `KernelAbstractions.jl` and `Adapt.jl`.
+Any other 5-point finite-difference operator can be plugged in by supplying a stencil function and a coarsening function — no changes to the library are required.
 
 ---
 
 ## Package Structure
+
+The repository is split into a **generic library** (`src/`) and a **Helmholtz application layer** (`helmholtz/`). The library knows nothing about the specific PDE; the application layer supplies the operator constructor, coefficient fields, and the top-level runner.
 
 ```
 julia_gmg/
 ├── Project.toml          # JuliaGMG 0.1.0; deps: KernelAbstractions, Krylov, LinearOperators, ...
 ├── Manifest.toml
 ├── bin/
-│   └── julia_gmg.jl      # CLI entry point with hand-rolled argument parser
-└── src/
-    ├── JuliaGMG.jl        # Module root: includes all files and re-exports public API
-    ├── types.jl           # Core structs (HelmholtzOp, Level, MGHierarchy) + hierarchy builder
+│   └── julia_gmg.jl      # CLI: loads library + includes helmholtz/ files, parses args, calls run_solver
+├── src/                  # JuliaGMG library — generic multigrid, agnostic to the specific PDE
+│   ├── JuliaGMG.jl        # Module root: includes all files and re-exports public API
+│   ├── types.jl           # FDOp, Level, MGHierarchy, build_hierarchy
+│   ├── operators.jl       # Matrix-free apply!, BCs, residual, vec_to_padded!/padded_to_vec!
+│   ├── smoother.jl        # Weighted Jacobi and Red-Black Gauss-Seidel smoothers
+│   ├── transfer.jl        # Full-weight restriction and piecewise-constant prolongation
+│   ├── vcycle.jl          # Recursive V-cycle and coarse-grid direct solve (LU)
+│   └── solver.jl          # GMRES/CG dispatcher types, MGPreconditioner, solve()
+└── helmholtz/            # Helmholtz application layer — included via include() in bin/julia_gmg.jl
+    ├── helmholtz_op.jl    # HelmholtzOp constructor (returns an FDOp)
     ├── alpha_fields.jl    # Six generators for the spatially varying coefficient α(x,y)
-    ├── operators.jl       # Matrix-free operator application, BCs, residual, helper utilities
-    ├── smoother.jl        # Weighted Jacobi and Red-Black Gauss-Seidel smoothers
-    ├── transfer.jl        # Full-weight restriction and piecewise-constant prolongation
-    ├── vcycle.jl          # Recursive V-cycle and coarse-grid direct solve (LU)
-    └── solver.jl          # MGPreconditioner wrapper + run_solver() top-level function
+    └── runner.jl          # make_rhs_and_exact, run_solver (manufactures RHS, calls solve(), reports error)
 ```
 
 ### Data layout convention
@@ -38,13 +45,45 @@ All field arrays are **padded**: interior cell `(i, j)` maps to array index `[i+
 ## Type Hierarchy
 
 ```
-HelmholtzOp{T, A}      matrix-free operator; stores α grid and mesh spacings
-Level{T, A}            one multigrid level; owns x, b, r arrays + an HelmholtzOp
-MGHierarchy{T, L, F}   full level stack, smoothing counts, pre-factorised coarse-grid LU
-MGPreconditioner{T, H} thin wrapper that exposes MGHierarchy as a LinearAlgebra preconditioner
+FDOp{T, A, StencilFn, CoarsenFn}   generic matrix-free 5-point FD operator
+HelmholtzOp(alpha, ...)             Helmholtz convenience constructor returning an FDOp (helmholtz/ layer)
+Level{T, A, Op}                     one multigrid level; owns x, b, r arrays + an operator
+MGHierarchy{T, L, F}                full level stack, smoothing counts, pre-factorised coarse-grid LU
+MGPreconditioner{T, H}              thin wrapper that exposes MGHierarchy as a LinearAlgebra preconditioner
+GMRES / CG                          empty structs used as solver selector tokens for solve()
 ```
 
-Type parameter `A <: AbstractMatrix{T}` propagates from the finest operator down through every level, so swapping `Matrix{Float64}` for a `CUDA.CuMatrix{Float32}` changes the backend without touching any algorithm code. The `Adapt.@adapt_structure` macro is applied to all three structs for this reason.
+Type parameter `A <: AbstractMatrix{T}` propagates from the finest operator down through every level, so swapping `Matrix{Float64}` for a `CUDA.CuMatrix{Float32}` changes the backend without touching any algorithm code. The `Adapt.@adapt_structure` macro is applied to all structs for this reason.
+
+---
+
+## The Generic Operator: `FDOp`
+
+`FDOp` is parameterised by two callables that encode the operator and its multigrid coarsening rule:
+
+```julia
+struct FDOp{T, A<:AbstractMatrix{T}, StencilFn, CoarsenFn}
+    coeff::A            # padded (nx+2)×(ny+2) coefficient array
+    nx::Int
+    ny::Int
+    hx::T
+    hy::T
+    stencil_fn::StencilFn   # (i, j, coeff, ihx2, ihy2) -> (diag, wx_neg, wx_pos, wy_neg, wy_pos)
+    coarsen_fn::CoarsenFn   # (fine_coeff, cnx, cny) -> coarse_coeff
+end
+```
+
+**`stencil_fn(i, j, coeff, ihx2, ihy2)`** returns five stencil weights for padded interior cell `(i, j)`:
+
+- `diag` — center (diagonal) weight
+- `wx_neg`, `wx_pos` — weights for the left and right neighbours
+- `wy_neg`, `wy_pos` — weights for the bottom and top neighbours
+
+`ihx2 = 1/hx²`, `ihy2 = 1/hy²` are pre-computed and passed in. `coeff` is the operator's full padded coefficient array at the current multigrid level.
+
+**`coarsen_fn(fine_coeff, cnx, cny)`** returns a `(cnx+2)×(cny+2)` coefficient array for the next coarser level. Only the coefficient array is coarsened; the `stencil_fn` is reused unchanged at every level.
+
+`apply!`, the smoothers, and `build_hierarchy` are all generic over `FDOp` — they call `stencil_fn` at each cell rather than hard-coding any particular operator.
 
 ---
 
@@ -66,13 +105,15 @@ Returns a padded `(nx+2) × (ny+2)` array with interior values filled by one of 
 op = HelmholtzOp(alpha, nx, ny, hx, hy)
 ```
 
-Stores the α field and mesh spacings. No matrix is assembled; `apply!` evaluates the 5-point stencil on the fly:
+Returns an `FDOp` whose `stencil_fn` implements the 5-point Helmholtz stencil:
 
 ```
 y[i,j] = (α[i,j] + 2/hx² + 2/hy²) * x[i,j]
         - (x[i-1,j] + x[i+1,j]) / hx²
         - (x[i,j-1] + x[i,j+1]) / hy²
 ```
+
+and whose `coarsen_fn` averages each 2×2 block of the fine α field (arithmetic mean).
 
 `fill_bc_dirichlet!` is called first to set ghost values: `x_ghost = −x_interior`, which enforces a zero Dirichlet condition at the cell face.
 
@@ -84,18 +125,27 @@ H = build_hierarchy(op; npre=2, npost=2, min_coarse=4)
 
 Halves the grid until `min(nx, ny) / 2 < min_coarse`. For each coarser level:
 
-- A `HelmholtzOp` is created with `nx/2, ny/2` and the coarsened α field, obtained by averaging each 2×2 block of fine-grid interior cells.
+- `op.coarsen_fn` produces the coarsened coefficient array.
+- A new `FDOp` is created with the same `stencil_fn` and `coarsen_fn` but the coarser grid and coefficient array.
 - A `Level` is allocated with zero-initialised `x`, `b`, `r` arrays of the correct padded size.
 
 At the coarsest level, `build_hierarchy` assembles the dense matrix (by applying the operator to each canonical basis vector) and pre-factorises it with `lu()`. This factorisation is reused throughout the solve.
 
 ### Step 4 — Krylov outer loop
 
+The library's `solve()` function is the main entry point. It is dispatched on a solver type token — pass `GMRES()` or `CG()`:
+
 ```julia
-x_sol, stats, ... = run_solver(op; solver_type=:gmres, tol_rel=1e-10, max_iters=300)
+x_sol, stats, residuals, solve_time =
+    solve(op, b_vec, H, GMRES(); tol_rel=1e-10, tol_abs=1e-16, max_iters=300)
+# or
+x_sol, stats, residuals, solve_time =
+    solve(op, b_vec, H, CG();   tol_rel=1e-10, tol_abs=1e-16, max_iters=300)
 ```
 
-`run_solver` manufactures the RHS from the known exact solution `u_exact(x,y) = sin(πx)sin(πy)` and wraps the operator and preconditioner for `Krylov.jl`:
+`b_vec` is a flat `nx*ny` right-hand-side vector. `solve()` wraps the operator and preconditioner for `Krylov.jl` without any Helmholtz-specific assumptions:
+
+In the Helmholtz application layer, `run_solver` manufactures `b_vec` from the known exact solution `u_exact(x,y) = sin(πx)sin(πy)` via `make_rhs_and_exact`, calls `solve()`, and reports the L2 error.
 
 - The operator is wrapped in a `LinearOperators.LinearOperator` that calls `apply!` without forming a matrix.
 - The hierarchy is wrapped in an `MGPreconditioner`; calling `mul!(z, P, r)` applies one V-cycle (step 5) setting `z ← M⁻¹ r`.
@@ -122,7 +172,7 @@ vcycle!(H, lvl):
   smooth!(lvl, npost)                    # npost RBGS sweeps
 ```
 
-**Smoother details.** `rbgs_sweep!` alternates a red pass (cells with `(i+j)` even) and a black pass (`(i+j)` odd), updating each cell in-place with a Gauss-Seidel solve against the 5-point stencil diagonal `α[i,j] + 2/hx² + 2/hy²`. `fill_bc_dirichlet!` is called after each half-sweep. `jacobi_sweep!` is also available (default weight `ω = 2/3`) but is not used by default.
+**Smoother details.** `rbgs_sweep!` alternates a red pass (cells with `(i+j)` even) and a black pass (`(i+j)` odd), updating each cell in-place with a Gauss-Seidel solve using the diagonal and off-diagonal weights from `stencil_fn`. `jacobi_sweep!` is also available (default weight `ω = 2/3`) but is not used by default.
 
 **Transfer operators.** `restrict!` uses full weighting (average of 4 fine children). `prolong_add!` uses piecewise-constant injection (same value broadcast to all 4 fine children, added to the current fine value).
 
@@ -145,149 +195,114 @@ Output format matches the C++ `mfes` `--verbose 2` output for direct comparison 
 
 ---
 
-## Blueprint: Adding a New Linear Operator
+## Adding a New Operator
 
-The current code is written for `HelmholtzOp` concretely rather than against an abstract interface. Adding a new operator means providing the same surface that `HelmholtzOp` provides and wiring it into the hierarchy builder and cycle.
+Construct an `FDOp` directly with your own `stencil_fn` and `coarsen_fn`. No library changes are needed.
 
-### What you need to implement
-
-| Function | Signature | Purpose |
-|---|---|---|
-| `apply!` | `apply!(y::A, op::MyOp, x::A)` | Matrix-free operator application `y ← A x` |
-| `fill_bc_*!` | `fill_bc!(x::A, op::MyOp)` | Fill ghost ring to enforce BCs |
-| `residual!` | `residual!(r::A, lvl::Level{T,A,MyOp})` | In-place `r ← b − A x` at a level |
-| `smooth!` | `smooth!(lvl::Level{T,A,MyOp}, nsweeps)` | One or more smoother sweeps |
-| Coarsening | called inside `build_hierarchy` | Restrict operator data (e.g. coefficients) to coarser grids |
-| Dense assembly | called for coarsest level | Build dense matrix for LU factorisation |
-
-### Step 1 — Define the operator struct
+### Pure Laplacian (−∇²u = f, no coefficient field)
 
 ```julia
-# src/operators.jl (or a new file)
-struct MyOp{T, A <: AbstractMatrix{T}}
-    coeff::A          # spatially varying coefficient, padded (nx+2)×(ny+2)
-    nx::Int
-    ny::Int
-    hx::T
-    hy::T
-end
-Adapt.@adapt_structure MyOp   # enables GPU portability
+dummy = zeros(T, nx+2, ny+2)   # coeff array unused
+op = FDOp(dummy, nx, ny, hx, hy,
+    (i, j, _, ihx2, ihy2) -> (2*ihx2 + 2*ihy2, -ihx2, -ihx2, -ihy2, -ihy2),
+    (fa, cnx, cny) -> similar(fa, cnx+2, cny+2))
 ```
 
-Store one such struct per multigrid level (pass it as the `op` field of `Level`). Coarsen the coefficient field in `build_hierarchy` by whichever averaging rule is appropriate for your operator (arithmetic, harmonic, etc.).
+### Variable-coefficient diffusion −∇·(α ∇φ) = f
 
-### Step 2 — Boundary conditions
+The divergence-form diffusion operator with a spatially varying coefficient α(x,y) > 0.
+Coefficient values are needed at cell faces, not cell centers. Using the harmonic mean at
+each face is the standard choice for strongly heterogeneous α because it preserves local
+flux balance:
+
+```text
+α_{i+½,j} = 2 α[i,j] α[i+1,j] / (α[i,j] + α[i+1,j])
+```
+
+The resulting 5-point stencil at interior padded cell `(i,j)` is:
+
+```text
+diag     =  (α_{i+½,j} + α_{i-½,j}) / hx²  +  (α_{i,j+½} + α_{i,j-½}) / hy²
+wx_pos   = -α_{i+½,j} / hx²
+wx_neg   = -α_{i-½,j} / hx²
+wy_pos   = -α_{i,j+½} / hy²
+wy_neg   = -α_{i,j-½} / hy²
+```
 
 ```julia
-function fill_bc_myop!(x::AbstractMatrix, op::MyOp)
-    # Fill the ghost ring of x to enforce your BC.
-    # For zero Dirichlet: ghost = -interior (same as fill_bc_dirichlet!).
-    # For Neumann: ghost = +interior.
-    # For periodic: ghost = opposite interior cell.
+stencil_fn = (i, j, coeff, ihx2, ihy2) -> begin
+    a  = coeff[i,   j  ]
+    ae = coeff[i+1, j  ]            # east neighbour (padded index)
+    aw = coeff[i-1, j  ]            # west
+    an = coeff[i,   j+1]            # north
+    as = coeff[i,   j-1]            # south
+    # harmonic-mean face conductivities
+    wxp = -2*a*ae / (a + ae) * ihx2
+    wxn = -2*a*aw / (a + aw) * ihx2
+    wyp = -2*a*an / (a + an) * ihy2
+    wyn = -2*a*as / (a + as) * ihy2
+    diag = -(wxp + wxn + wyp + wyn)  # positive (M-matrix)
+    (diag, wxn, wxp, wyn, wyp)
 end
+
+# Harmonic coarsening: preserves the divergence-form structure at coarser levels
+coarsen_fn = (fa, cnx, cny) -> begin
+    ca = similar(fa, cnx+2, cny+2); fill!(ca, zero(eltype(fa)))
+    @views ca[2:cnx+1, 2:cny+1] .= 4 ./ (
+        1 ./ fa[2:2:2*cnx+1, 2:2:2*cny+1] .+
+        1 ./ fa[3:2:2*cnx+2, 2:2:2*cny+1] .+
+        1 ./ fa[2:2:2*cnx+1, 3:2:2*cny+2] .+
+        1 ./ fa[3:2:2*cnx+2, 3:2:2*cny+2])
+    ca
+end
+
+op = FDOp(alpha, nx, ny, hx, hy, stencil_fn, coarsen_fn)
 ```
 
-### Step 3 — Operator application
+Note: `coeff` at the ghost ring `[1,:]`, `[end,:]`, `[:,1]`, `[:,end]` is zero by convention
+(the α field is only defined for interior cells). The ghost-ring stencil accesses
+`coeff[i±1,j]` or `coeff[i,j±1]` for boundary-adjacent cells; if α can be zero on the
+ghost ring, guard with `(a + ae) > 0` or clamp the denominator.
+
+---
+
+### Variable-coefficient Helmholtz with harmonic coarsening
 
 ```julia
-function apply!(y::AbstractMatrix, op::MyOp, x::AbstractMatrix)
-    fill_bc_myop!(x, op)
-    nx, ny, hx, hy = op.nx, op.ny, op.hx, op.hy
-    @inbounds for j in 2:ny+1, i in 2:nx+1
-        # 5-point (or 9-point, or anisotropic, etc.) stencil
-        # Use op.coeff[i,j] for any spatially varying coefficient
-        y[i,j] = ...
-    end
-end
+op = FDOp(alpha, nx, ny, hx, hy,
+    (i, j, coeff, ihx2, ihy2) ->
+        (coeff[i,j] + 2*ihx2 + 2*ihy2, -ihx2, -ihx2, -ihy2, -ihy2),
+    (fa, cnx, cny) -> begin
+        ca = similar(fa, cnx+2, cny+2); fill!(ca, zero(eltype(fa)))
+        # harmonic average of 2×2 blocks
+        @views ca[2:cnx+1, 2:cny+1] .= 4 ./ (
+            1 ./ fa[2:2:2*cnx+1, 2:2:2*cny+1] .+
+            1 ./ fa[3:2:2*cnx+2, 2:2:2*cny+1] .+
+            1 ./ fa[2:2:2*cnx+1, 3:2:2*cny+2] .+
+            1 ./ fa[3:2:2*cnx+2, 3:2:2*cny+2])
+        ca
+    end)
 ```
 
-### Step 4 — Residual
+### Stencil function signature reference
 
-```julia
-function residual!(r::AbstractMatrix, lvl::Level{T,A,MyOp{T,A}}) where {T,A}
-    fill!(r, zero(T))
-    apply!(r, lvl.op, lvl.x)   # r ← A x
-    @inbounds for j in 2:lvl.op.ny+1, i in 2:lvl.op.nx+1
-        r[i,j] = lvl.b[i,j] - r[i,j]
-    end
-end
+```text
+stencil_fn(i, j, coeff, ihx2, ihy2) -> (diag, wx_neg, wx_pos, wy_neg, wy_pos)
 ```
 
-### Step 5 — Smoother
+| Argument | Meaning |
+| --- | --- |
+| `i`, `j` | Padded array indices of the current interior cell |
+| `coeff` | Full padded coefficient array at this multigrid level |
+| `ihx2`, `ihy2` | Precomputed `1/hx²`, `1/hy²` |
+| `diag` | Center (diagonal) stencil weight |
+| `wx_neg`, `wx_pos` | Weights for `x[i-1,j]`, `x[i+1,j]` |
+| `wy_neg`, `wy_pos` | Weights for `x[i,j-1]`, `x[i,j+1]` |
 
-```julia
-function smooth!(lvl::Level{T,A,MyOp{T,A}}, nsweeps::Int) where {T,A}
-    op = lvl.op
-    hx2, hy2 = op.hx^2, op.hy^2
-    for _ in 1:nsweeps
-        for colour in (0, 1)           # red, then black
-            fill_bc_myop!(lvl.x, op)
-            @inbounds for j in 2:op.ny+1, i in 2:op.nx+1
-                (i + j) % 2 == colour || continue
-                diag = op.coeff[i,j] + 2/hx2 + 2/hy2   # adjust for your operator
-                off  = (lvl.x[i-1,j] + lvl.x[i+1,j]) / hx2 +
-                       (lvl.x[i,j-1] + lvl.x[i,j+1]) / hy2
-                lvl.x[i,j] = (lvl.b[i,j] + off) / diag
-            end
-        end
-    end
-end
+The stencil function is called identically inside `apply!` and both smoothers, so it is the single source of truth for the operator.
+
+```text
+coarsen_fn(fine_coeff, cnx, cny) -> coarse_coeff
 ```
 
-Override `smooth!` whenever your operator has a different (possibly spatially varying) diagonal from the Helmholtz case.
-
-### Step 6 — Hierarchy builder
-
-In `types.jl`, `build_hierarchy` is currently specific to `HelmholtzOp`. To support `MyOp`, either:
-
-- **Extend the existing function** by dispatching on the fine-level operator type, or
-- **Write a new `build_hierarchy` method** with the same signature but a different first argument type.
-
-Inside the builder:
-1. Create `MyOp` structs for each coarse level with coarsened coefficient data.
-2. Allocate `Level` structs with zero-filled arrays.
-3. At the coarsest level, assemble the dense matrix (apply `MyOp` to each basis vector) and call `lu()`.
-
-```julia
-function build_hierarchy(fine_op::MyOp{T,A}; npre=2, npost=2, min_coarse=4) where {T,A}
-    levels = Level{T,A,MyOp{T,A}}[]
-    op = fine_op
-    while min(op.nx, op.ny) ÷ 2 >= min_coarse
-        push!(levels, Level(op))     # allocate x, b, r at this resolution
-        op = coarsen(op)             # halve nx/ny, restrict coeff
-    end
-    push!(levels, Level(op))
-    coarse_mat = assemble_dense(levels[end].op)
-    coarse_lu  = lu(coarse_mat)
-    MGHierarchy(levels, npre, npost, coarse_lu)
-end
-```
-
-### Step 7 — Wire into `run_solver` and the CLI
-
-`run_solver` (in `solver.jl`) calls `make_rhs_and_exact` which is also Helmholtz-specific. Provide a corresponding function for your operator:
-
-```julia
-function make_rhs_and_exact(op::MyOp{T}) where T
-    # return (b, u_exact) as padded arrays
-    # b = A * u_exact  for a chosen manufactured solution
-end
-```
-
-Then add a dispatch branch in `run_solver`, or write a thin wrapper that calls the same Krylov + V-cycle machinery with the new operator and preconditioner. The `MGPreconditioner` and `vcycle!` are generic over the level type, so they require no changes as long as `smooth!`, `residual!`, `restrict!`, and `prolong_add!` dispatch correctly on the new operator type.
-
-In `bin/julia_gmg.jl`, add a command-line flag (e.g. `--op myop`) and branch to the new constructor.
-
-### Summary checklist
-
-| Item | Required | Notes |
-|---|---|---|
-| Operator struct with `Adapt.@adapt_structure` | Yes | Enables GPU portability |
-| `fill_bc_*!(x, op)` | Yes | Called by `apply!` and `smooth!` |
-| `apply!(y, op, x)` | Yes | Core stencil evaluation |
-| `residual!(r, lvl)` | Yes | `r ← b − A x` |
-| `smooth!(lvl, nsweeps)` | Yes | Override if diagonal differs from Helmholtz |
-| `build_hierarchy(op; ...)` | Yes | Coarsen coefficients, pre-factorise coarsest level |
-| `make_rhs_and_exact(op)` | Yes | Manufactured solution for testing |
-| `restrict!` / `prolong_add!` | Only if non-standard | Default full-weight / piecewise-const work for most FD operators |
-| CLI flag in `bin/julia_gmg.jl` | If CLI access needed | |
+Returns a `(cnx+2)×(cny+2)` padded array. The ghost ring should be left zero (it is filled at runtime by `fill_bc_dirichlet!`). The same `stencil_fn` is reused at every coarser level — only `coeff` and the grid dimensions change.

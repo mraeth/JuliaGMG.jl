@@ -1,8 +1,8 @@
-# Matrix-free Helmholtz operator: (α - ∇²)u = f
+# Matrix-free finite-difference operator.
 # Padded arrays: interior at [2:nx+1, 2:ny+1], ghost ring at rows/cols 1 and nx+2/ny+2.
 # Dirichlet BCs: u_ghost = -u_interior (linear reflection; boundary midpoint = 0).
 
-function fill_bc_dirichlet!(x, op::HelmholtzOp)
+function fill_bc_dirichlet!(x, op)
     nx, ny = op.nx, op.ny
     @views x[1,      2:ny+1] .= .-x[2,    2:ny+1]
     @views x[nx+2,   2:ny+1] .= .-x[nx+1, 2:ny+1]
@@ -13,15 +13,16 @@ function fill_bc_dirichlet!(x, op::HelmholtzOp)
 end
 
 # y ← A*x  (interior only; ghost ring of y is left undefined)
-function apply!(y, op::HelmholtzOp, x)
+function apply!(y, op::FDOp, x)
     fill_bc_dirichlet!(x, op)
     nx, ny = op.nx, op.ny
     ihx2 = 1 / op.hx^2
     ihy2 = 1 / op.hy^2
     @inbounds for j in 2:ny+1, i in 2:nx+1
-        y[i,j] = (op.alpha[i,j] + 2*ihx2 + 2*ihy2) * x[i,j] -
-                 (x[i-1,j] + x[i+1,j]) * ihx2 -
-                 (x[i,j-1] + x[i,j+1]) * ihy2
+        d, wx_neg, wx_pos, wy_neg, wy_pos = op.stencil_fn(i, j, op.coeff, ihx2, ihy2)
+        y[i,j] = d * x[i,j] +
+                 wx_neg * x[i-1,j] + wx_pos * x[i+1,j] +
+                 wy_neg * x[i,j-1] + wy_pos * x[i,j+1]
     end
     y
 end
@@ -37,20 +38,6 @@ end
 # Euclidean norm of interior DOFs (unweighted, matching MFES convention)
 function interior_norm(x, nx, ny)
     sqrt(sum(abs2, @view(x[2:nx+1, 2:ny+1])))
-end
-
-# Build RHS f by applying A to the manufactured solution u_exact = sin(πx)sin(πy)
-function make_rhs_and_exact(op::HelmholtzOp{T}) where T
-    nx, ny = op.nx, op.ny
-    u = zeros(T, nx+2, ny+2)
-    @inbounds for j in 1:ny, i in 1:nx
-        x = (i - T(0.5)) * op.hx
-        y = (j - T(0.5)) * op.hy
-        u[i+1, j+1] = sin(T(π)*x) * sin(T(π)*y)
-    end
-    b = zeros(T, nx+2, ny+2)
-    apply!(b, op, u)
-    b, u
 end
 
 # Flat (length nx*ny) ↔ padded (nx+2)×(ny+2) helpers
