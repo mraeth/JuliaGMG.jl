@@ -1,6 +1,6 @@
 # JuliaGMG
 
-A GPU-capable Julia version of a geometric multigrid preconditioned Krylov solver. Solves 2D variable-coefficient PDEs on the unit square with Dirichlet boundary conditions using a Krylov outer loop (GMRES or CG) preconditioned by one multigrid V-cycle per iteration. The implementation runs on CPU today and is GPU-portable via `KernelAbstractions.jl` and `Adapt.jl`.
+A Julia geometric-multigrid-preconditioned Krylov solver. Solves 2D variable-coefficient PDEs on the unit square with Dirichlet boundary conditions using a Krylov outer loop (GMRES or CG) preconditioned by one multigrid V-cycle per iteration. The implementation runs on CPU (plain Julia loops); GPU kernels via `KernelAbstractions.jl` and `Adapt.jl` are planned, and the types are already parameterised for it (see below).
 
 The built-in operator is the variable-coefficient Helmholtz equation:
 
@@ -12,15 +12,32 @@ Any other 5-point finite-difference operator can be plugged in by supplying a st
 
 ---
 
+## Installation
+
+JuliaGMG is distributed through the BSLRegistry (registration pending until v0.1.0 is registered):
+
+```julia
+pkg> registry add https://gitlab.mpcdf.mpg.de/bsl6d/BSLRegistry.git
+pkg> add JuliaGMG
+```
+
+Run the tests from a checkout:
+
+```bash
+julia --project -e 'using Pkg; Pkg.test()'
+```
+
+---
+
 ## Package Structure
 
 The repository is split into a **generic library** (`src/`) and a **Helmholtz application layer** (`helmholtz/`). The library knows nothing about the specific PDE; the application layer supplies the operator constructor, coefficient fields, and the top-level runner.
 
 ```
-julia_gmg/
+JuliaGMG.jl/
 ├── Project.toml          # JuliaGMG 0.1.0; deps: KernelAbstractions, Krylov, LinearOperators, ...
-├── Manifest.toml
 ├── bin/
+│   ├── Project.toml      # CLI environment: JuliaGMG (path ".."), LinearAlgebra, Printf, Random
 │   └── julia_gmg.jl      # CLI: loads library + includes helmholtz/ files, parses args, calls run_solver
 ├── src/                  # JuliaGMG library — generic multigrid, agnostic to the specific PDE
 │   ├── JuliaGMG.jl        # Module root: includes all files and re-exports public API
@@ -34,6 +51,7 @@ julia_gmg/
     ├── helmholtz_op.jl    # HelmholtzOp constructor (returns an FDOp)
     ├── alpha_fields.jl    # Six generators for the spatially varying coefficient α(x,y)
     └── runner.jl          # make_rhs_and_exact, run_solver (manufactures RHS, calls solve(), reports error)
+└── test/                 # Pkg.test(): MMS convergence, h-independent iterations, apply! vs dense matrix
 ```
 
 ### Data layout convention
@@ -53,7 +71,7 @@ MGPreconditioner{T, H}              thin wrapper that exposes MGHierarchy as a L
 GMRES / CG                          empty structs used as solver selector tokens for solve()
 ```
 
-Type parameter `A <: AbstractMatrix{T}` propagates from the finest operator down through every level, so swapping `Matrix{Float64}` for a `CUDA.CuMatrix{Float32}` changes the backend without touching any algorithm code. The `Adapt.@adapt_structure` macro is applied to all structs for this reason.
+Type parameter `A <: AbstractMatrix{T}` propagates from the finest operator down through every level, and `Adapt.@adapt_structure` is applied to `FDOp` and `Level`, in preparation for GPU arrays (e.g. `CUDA.CuMatrix{Float32}`). The loops in `apply!`, the smoothers and the transfer operators are plain CPU loops today; GPU kernels are planned.
 
 ---
 
@@ -182,16 +200,19 @@ vcycle!(H, lvl):
 
 ## Running
 
+The CLI has its own environment in `bin/` (it needs `Printf` and `Random`, which the library does not):
+
 ```bash
-# From the julia_gmg/ directory
-julia --project bin/julia_gmg.jl --nx 128 --ny 128 \
+# From the JuliaGMG.jl/ directory
+julia --project=bin -e 'using Pkg; Pkg.instantiate()'   # once
+julia --project=bin bin/julia_gmg.jl --nx 128 --ny 128 \
       --alpha_min 1.0 --alpha_max 150.0 \
       --alpha_field LogUniform \
-      --solver gmres --tol_rel 1e-10 --max_iters 300 \
+      --solver GMRES --tol_rel 1e-10 --max_iters 300 \
       --npre 2 --npost 2 --min_coarse 4
 ```
 
-Output format matches the C++ `mfes` `--verbose 2` output for direct comparison by `../run_comparison.py`.
+`--solver CG` selects CG (any other value runs GMRES). The right-hand side is manufactured by applying the discrete operator to `sin(πx)sin(πy)`, so the reported L2 error measures the algebraic (solver) error, not the discretisation error.
 
 ---
 
@@ -257,11 +278,12 @@ stencil_fn = (i, j, coeff, ihx2, ihy2) -> begin
     aw = coeff[i-1, j  ]            # west
     an = coeff[i,   j+1]            # north
     as = coeff[i,   j-1]            # south
-    # harmonic-mean face conductivities
-    wxn = -2*a*aw / (a + aw) * ihx2   # west
-    wxp = -2*a*ae / (a + ae) * ihx2   # east
-    wyn = -2*a*as / (a + as) * ihy2   # south
-    wyp = -2*a*an / (a + an) * ihy2   # north
+    # harmonic-mean face conductivities; on boundary faces (ghost coeff = 0) use the cell value
+    face(a, b) = b > 0 ? 2*a*b / (a + b) : a
+    wxn = -face(a, aw) * ihx2   # west
+    wxp = -face(a, ae) * ihx2   # east
+    wyn = -face(a, as) * ihy2   # south
+    wyp = -face(a, an) * ihy2   # north
     diag = -(wxn + wxp + wyn + wyp)   # positive (M-matrix)
     (wxn, wxp, wyn, wyp, diag)        # ordered: west, east, south, north, center
 end
@@ -281,9 +303,10 @@ op = FDOp(alpha, nx, ny, hx, hy, STENCIL_5PT, stencil_fn, coarsen_fn)
 ```
 
 Note: `coeff` at the ghost ring `[1,:]`, `[end,:]`, `[:,1]`, `[:,end]` is zero by convention
-(the α field is only defined for interior cells). The ghost-ring stencil accesses
-`coeff[i±1,j]` or `coeff[i,j±1]` for boundary-adjacent cells; if α can be zero on the
-ghost ring, guard with `(a + ae) > 0` or clamp the denominator.
+(the α field is only defined for interior cells, and `coarsen_fn` leaves it zero on coarser
+levels). A plain harmonic mean would then give zero boundary-face conductivity, i.e. a
+singular pure-Neumann operator instead of the Dirichlet one; `face` above falls back to the
+cell value there. This variant is tested in `test/runtests.jl` (2nd-order convergence).
 
 ---
 

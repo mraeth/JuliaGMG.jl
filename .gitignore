@@ -2,7 +2,7 @@
 *.jl.cov
 *.jl.mem
 *.ji
-/Manifest.toml
+Manifest.toml
 /docs/build/
 
 # Julia package artifacts

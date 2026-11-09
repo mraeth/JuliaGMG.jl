@@ -1,16 +1,13 @@
 #!/usr/bin/env julia
 # CLI entry point for JuliaGMG Helmholtz solver.
-# Output format matches MFES --verbose 2 so run_comparison.py's parse_mfes() works directly.
 #
-# Usage:
-#   julia --project=<julia_gmg_dir> bin/julia_gmg.jl \
+# Usage (from the repository root; bin/ has its own environment):
+#   julia --project=bin -e 'using Pkg; Pkg.instantiate()'   # once
+#   julia --project=bin bin/julia_gmg.jl \
 #       --op HELMHOLTZ --alpha_field LogUniform \
 #       --alpha_min 1 --alpha_max 150 \
 #       --nx 128 --ny 128 --bc DIRICHLET \
 #       --solver GMRES --tol_rel 1e-10 --max_iters 300 --verbose 2
-
-using Pkg
-Pkg.activate(joinpath(@__DIR__, ".."))
 
 using JuliaGMG
 using Printf
