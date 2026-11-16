@@ -1,26 +1,25 @@
 using LinearAlgebra: ldiv!
 
 # ---------------------------------------------------------------------------
-# Coarse-level direct solve via the pre-factorized LU stored in the hierarchy.
-# The coarse grid is ≤ min_coarse² DOFs; Array()/copyto! cost is negligible.
+# Coarse-level direct solve via the pre-factorized LUs stored in the hierarchy
+# (one per plane).  Array()/copyto! cost is negligible on the small coarse grid.
 # ---------------------------------------------------------------------------
 function coarse_solve!(H::MGHierarchy, lvl_idx::Int)
     lvl    = H.levels[lvl_idx]
     nx, ny = lvl.op.nx, lvl.op.ny
-    n      = nx * ny
     T      = eltype(lvl.x)
 
     b_cpu = Array(lvl.b)
-    b_vec = Vector{T}(undef, n)
-    @inbounds for j in 1:ny, i in 1:nx
-        b_vec[(j-1)*nx + i] = b_cpu[i+1, j+1]
-    end
-
-    ldiv!(H.coarse_lu, b_vec)
-
-    x_cpu = zeros(T, nx+2, ny+2)
-    @inbounds for j in 1:ny, i in 1:nx
-        x_cpu[i+1, j+1] = b_vec[(j-1)*nx + i]
+    x_cpu = zeros(T, size(b_cpu))
+    b_vec = Vector{T}(undef, nx * ny)
+    for k in axes(b_cpu, 3)
+        @inbounds for j in 1:ny, i in 1:nx
+            b_vec[(j-1)*nx + i] = b_cpu[i+1, j+1, k]
+        end
+        ldiv!(H.coarse_lu[k], b_vec)
+        @inbounds for j in 1:ny, i in 1:nx
+            x_cpu[i+1, j+1, k] = b_vec[(j-1)*nx + i]
+        end
     end
     copyto!(lvl.x, x_cpu)
 end
@@ -48,5 +47,5 @@ function vcycle!(H::MGHierarchy, lvl_idx::Int=1)
         prolong_add!(lvl.x, next.x, next.op)
     end
 
-    smooth!(lvl, H.npost)
+    smooth!(lvl, H.npost; reverse=true)   # reverse colour order: symmetric V-cycle
 end
