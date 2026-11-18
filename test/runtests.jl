@@ -277,4 +277,28 @@ end
             end
         end
     end
+
+    @testset "Matrix-free GMRES: nonsymmetric operator, user preconditioner" begin
+        # A = (1 − ∇²) + skew-symmetric S, applied as a function; preconditioned by the V-cycle of
+        # the symmetric part, and by nothing (identity).
+        nx = ny = 32
+        op = FDOp(padded((x, y) -> 1.0, nx, ny), nx, ny, 1/nx, 1/ny, STENCIL_5PT,
+                  helmholtz_stencil, coarsen_arith, ntuple(_ -> Dirichlet(), 4))
+        P  = MGPreconditioner(build_hierarchy(op))
+        rng = MersenneTwister(5)
+        S = randn(rng, nx*ny, nx*ny)
+        S = 50 * (S - S') / sqrt(nx*ny)
+        xp, yp = zeros(size(op.coeff)), zeros(size(op.coeff))
+        A!(y, x) = (JuliaGMG._apply_flat!(y, op, x, xp, yp); mul!(y, S, x, 1, 1))
+        b = randn(rng, nx*ny)
+        r = similar(b)
+        its = map((((y, x) -> mul!(y, P, x)), ((y, x) -> copyto!(y, x)))) do P!
+            x, st = solve(A!, b, P!, GMRES(); tol_rel=1e-10)
+            A!(r, x)
+            @test norm(r - b) <= 1e-9 * norm(b)
+            st.niter
+        end
+        @test its[1] < its[2]
+        println(rpad("Matrix-free GMRES, MG / identity preconditioner", 52), "iterations ", its)
+    end
 end

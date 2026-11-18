@@ -46,7 +46,7 @@ JuliaGMG.jl/
 │   ├── smoother.jl        # Weighted Jacobi and Red-Black Gauss-Seidel smoothers
 │   ├── transfer.jl        # Averaging restriction and piecewise-constant prolongation (full or semi-coarsening)
 │   ├── vcycle.jl          # Recursive V-cycle and coarse-grid direct solve (LU)
-│   └── solver.jl          # GMRES/CG dispatcher types, MGPreconditioner, solve()
+│   └── solver.jl          # GMRES/CG dispatcher types, MGPreconditioner, solve() (FDOp or matrix-free)
 └── helmholtz/            # Helmholtz application layer — included via include() in bin/julia_gmg.jl
     ├── helmholtz_op.jl    # HelmholtzOp constructor (returns an FDOp)
     ├── alpha_fields.jl    # Six generators for the spatially varying coefficient α(x,y)
@@ -213,6 +213,14 @@ x_sol, stats, residuals, solve_time =
 # or
 x_sol, stats, residuals, solve_time =
     solve(op, b_vec, H, CG();   tol_rel=1e-10, tol_abs=1e-16, max_iters=300)
+```
+
+For an operator that is not an `FDOp` (e.g. a nonsymmetric or pseudo-spectral one), `solve` also takes the operator and a right preconditioner as functions on flat vectors:
+
+```julia
+x_sol, stats, residuals, solve_time =
+    solve(A!, b_vec, P!, GMRES(); tol_rel=1e-10, tol_abs=1e-16, max_iters=300)
+# A!(y, x): y = A x;   P!(y, x): y ≈ A⁻¹ x, e.g. (y, x) -> mul!(y, MGPreconditioner(H), x)
 ```
 
 `b_vec` is a flat `nx*ny*nb` right-hand-side vector (plane-major, see [Data layout](#data-layout-convention)). `solve()` wraps the operator and preconditioner for `Krylov.jl` without any Helmholtz-specific assumptions:

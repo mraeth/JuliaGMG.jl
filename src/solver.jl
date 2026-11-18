@@ -81,6 +81,29 @@ function solve(op, b_vec::AbstractVector{T}, H::MGHierarchy, ::GMRES;
     x_sol, stats, residuals, (time_ns() - t0) * 1e-9
 end
 
+# ---------------------------------------------------------------------------
+# solve — matrix-free GMRES with a user right preconditioner
+#   A!(y, x) : y = A x on flat vectors (A need not be symmetric)
+#   P!(y, x) : y ≈ A⁻¹ x, e.g. a direct solve of a simplified operator, or
+#              (y, x) -> mul!(y, MGPreconditioner(H), x) for a GMG cycle
+# Returns (x_sol, stats, residuals, solve_time) as above.
+# ---------------------------------------------------------------------------
+function solve(A!, b_vec::AbstractVector{T}, P!, ::GMRES;
+               tol_rel::T = T(1e-10),
+               tol_abs::T = T(1e-16),
+               max_iters::Int = 300) where T
+    n   = length(b_vec)
+    Aop = LinearOperator(T, n, n, false, false, A!)
+    Pop = LinearOperator(T, n, n, false, false, P!)
+    t0  = time_ns()
+    x_sol, stats = Krylov.gmres(Aop, b_vec; N=Pop,
+                                 rtol=tol_rel, atol=tol_abs,
+                                 itmax=max_iters, history=true, verbose=0)
+    residuals = length(stats.residuals) > 1 ? collect(stats.residuals[2:end]) :
+                                               collect(stats.residuals)
+    x_sol, stats, residuals, (time_ns() - t0) * 1e-9
+end
+
 function solve(op, b_vec::AbstractVector{T}, H::MGHierarchy, ::CG;
                tol_rel::T = T(1e-10),
                tol_abs::T = T(1e-16),
